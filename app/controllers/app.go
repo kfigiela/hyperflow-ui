@@ -5,11 +5,9 @@ import (
 	"encoding/json"
 	"github.com/revel/revel"
 	"github.com/revel/revel/cache"
-    "strings"
+	"net/http"
 	"strconv"
-	"text/template"
 	"time"
-    "net/http"
 )
 
 const (
@@ -106,68 +104,70 @@ func (c App) NewWorkflow(
 		return c.Redirect(App.Index)
 	}
 
-	// read workflow template and adapt filenames
 	now := strconv.FormatInt(int64(time.Now().Unix()), 10)
-	var defaultWorkflow bytes.Buffer
-	t := template.New("workflow.json")
-	t, _ = t.ParseFiles(revel.BasePath + "/conf/workflow.json")
 	f := Filenames{
 		FilenameOutArchived: "md-simulation-" + now + ".tgz",
 		FilenameOutVideo:    "md-simulation-" + now + ".avi",
 	}
-	err := t.Execute(&defaultWorkflow, f)
-	if err != nil {
-		panic(err)
-	}
 
-	// parse template into JSON object
+	// generate workflow
 	var workflowDescription WorkflowObject
-	err = json.Unmarshal(defaultWorkflow.Bytes(), &workflowDescription)
-	if err != nil {
-		panic(err)
+
+	workflowDescription.Ins = []string{"start"}
+	workflowDescription.Signals = []SignalsType{
+		SignalsType{Name: "start", Data: []string{"start"}},
 	}
 
-	// modify default description as requested by user
-	for i := range workflowDescription.Processes {
-		if strings.HasPrefix(workflowDescription.Processes[i].Name, "run-cmd") {
-			// number of molecules
-			strNumOfMolecules := strconv.FormatUint(uint64(number_of_molecules), 10)
-			workflowDescription.Processes[i].Config.Executor.Args[0] = strNumOfMolecules
-			// simulation end time
-			strSimulationEndTime := strconv.FormatFloat(float64(simulation_end_time), 'f', -1, 64)
-			workflowDescription.Processes[i].Config.Executor.Args[1] = strSimulationEndTime
-			// temperature
-			strTemperature := strconv.FormatInt(int64(42), 10)
-			workflowDescription.Processes[i].Config.Executor.Args[2] = strTemperature
-			// append output filename
-			workflowDescription.Processes[i].Config.Executor.Args = append(workflowDescription.Processes[i].Config.Executor.Args, f.FilenameOutArchived)
+	for temperature := min_temperature; temperature <= max_temperature; temperature += step_temperature {
+		strTemp := strconv.FormatFloat(float64(temperature), 'f', -1, 64)
+		process := ProcessesType{
+			Name:     "run-simulation-" + strTemp,
+			Function: "amqpCommand",
+			Type:     "dataflow",
+			Config: ConfigType{
+				Executor: ExecutorType{
+					Executable: "/MD_v4_MPI/run-cmd.sh",
+					Args: []string{
+						strconv.FormatUint(uint64(number_of_molecules), 10),
+						strconv.FormatFloat(float64(simulation_end_time), 'f', -1, 64),
+						strconv.FormatFloat(float64(temperature), 'f', -1, 64),
+						"md-simulation-" + now + "-" + strTemp + ".tgz",
+					},
+				},
+			},
+			Ins:  []string{"start"},
+			Outs: []string{"md-simulation-" + now + "-" + strTemp + ".tgz"},
 		}
-	}
+		workflowDescription.Processes = append(workflowDescription.Processes, process)
+		workflowDescription.Outs = append(workflowDescription.Outs, "md-simulation-"+now+"-"+strTemp+".tgz")
+		workflowDescription.Signals = append(workflowDescription.Signals, SignalsType{Name: "md-simulation-" + now + "-" + strTemp + ".tgz"})
 
-	// keep or remove movie generation
-	if record_movie == false {
-		// remove make-movie task
-		for i := range workflowDescription.Processes {
-			if strings.HasPrefix(workflowDescription.Processes[i].Name, "make-movie") {
-				workflowDescription.Processes = append(workflowDescription.Processes[:i], workflowDescription.Processes[i+1:]...)
+		if record_movie == true {
+			process := ProcessesType{
+				Name:     "run-povray-" + strTemp,
+				Function: "amqpCommand",
+				Type:     "dataflow",
+				Config: ConfigType{
+					Executor: ExecutorType{
+						Executable: "/MD_v4_MPI/make-movie.sh",
+						Args: []string{
+							"md-simulation-" + now + "-" + strTemp + ".tgz",
+							"md-simulation-" + now + "-" + strTemp + ".avi",
+						},
+					},
+				},
+				Ins:  []string{"md-simulation-" + now + "-" + strTemp + ".tgz"},
+				Outs: []string{"md-simulation-" + now + "-" + strTemp + ".avi"},
 			}
-		}
-		// remove any signals related to AVI files
-		for i := range workflowDescription.Signals {
-			if strings.HasSuffix(workflowDescription.Signals[i].Name, ".avi") {
-				workflowDescription.Signals = append(workflowDescription.Signals[:i], workflowDescription.Signals[i+1:]...)
-			}
-		}
-		// remove any output strings related to AVI files
-		for i := range workflowDescription.Outs {
-			if strings.HasSuffix(workflowDescription.Outs[i], ".avi") {
-				workflowDescription.Outs = append(workflowDescription.Outs[:i], workflowDescription.Outs[i+1:]...)
-			}
+			workflowDescription.Processes = append(workflowDescription.Processes, process)
+			workflowDescription.Outs = append(workflowDescription.Outs, "md-simulation-"+now+"-"+strTemp+".avi")
+			workflowDescription.Signals = append(workflowDescription.Signals, SignalsType{Name: "md-simulation-" + now + "-" + strTemp + ".avi"})
+
 		}
 	}
 
 	// post workflow to HyperFlow
-	b, err := json.Marshal(workflowDescription)
+	b, err := json.MarshalIndent(workflowDescription, "", "  ")
 	if err != nil {
 		panic(err)
 	}
